@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>透光浮雕 STL 生成器</title>
+  <style>
+    :root { --ink:#17212b; --muted:#637282; --line:#dbe3ea; --card:#fff; --accent:#0d7769; --bg:#f4f8f7; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--bg); font:15px/1.5 system-ui,"Microsoft YaHei",sans-serif; }
+    main { max-width:1120px; margin:0 auto; padding:44px 24px 60px; }
+    h1 { margin:0; font-size:clamp(28px,4vw,42px); letter-spacing:-.04em; }
+    .intro { max-width:650px; color:var(--muted); margin:9px 0 30px; }
+    .layout { display:grid; grid-template-columns:370px 1fr; gap:22px; align-items:start; }
+    .panel { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:22px; box-shadow:0 12px 32px #1c51400d; }
+    label { display:block; margin:16px 0 6px; font-weight:650; }
+    label:first-child { margin-top:0; }
+    input { width:100%; padding:10px 11px; color:var(--ink); background:#fbfdfd; border:1px solid #cbd8d8; border-radius:8px; font:inherit; }
+    input:focus { outline:3px solid #bce8df; border-color:var(--accent); }
+    .two-col { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .hint { margin:5px 0 0; color:var(--muted); font-size:12px; }
+    button { width:100%; margin-top:22px; padding:12px 16px; border:0; border-radius:9px; color:white; background:var(--accent); font:inherit; font-weight:700; cursor:pointer; }
+    button:hover:not(:disabled) { background:#096155; }
+    button:disabled { cursor:not-allowed; opacity:.5; }
+    .preview { min-height:560px; display:flex; flex-direction:column; }
+    #placeholder { margin:auto; text-align:center; color:var(--muted); }
+    #canvas { display:none; width:100%; max-height:455px; object-fit:contain; image-rendering:auto; background:#e8eeec; border-radius:10px; }
+    #stats { min-height:24px; margin:16px 0 0; color:var(--muted); font-size:13px; }
+    .privacy { margin:14px 0 0; color:var(--muted); font-size:12px; }
+    @media (max-width:800px) { main { padding:28px 16px; } .layout { grid-template-columns:1fr; } .preview { min-height:360px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>透光浮雕 STL 生成器</h1>
+    <p class="intro">将图片转成适合背光展示和 3D 打印的透光浮雕。深色区域更厚，浅色区域更薄。</p>
+    <section class="layout">
+      <form class="panel" id="settings">
+        <label for="file">选择图片</label>
+        <input id="file" type="file" accept="image/*" required>
+        <div class="two-col">
+          <div><label for="width">成品宽度 (mm)</label><input id="width" type="number" min="10" step="1" value="100"></div>
+          <div><label for="height">成品高度 (mm)</label><input id="height" type="number" min="10" step="1" placeholder="自动"></div>
+        </div>
+        <p class="hint">高度留空时按图片比例自动计算。</p>
+        <div class="two-col">
+          <div><label for="min">最薄处 (mm)</label><input id="min" type="number" min="0.1" step="0.1" value="0.6"></div>
+          <div><label for="max">最厚处 (mm)</label><input id="max" type="number" min="0.1" step="0.1" value="2.5"></div>
+        </div>
+        <div class="two-col">
+          <div><label for="resolution">最大分辨率</label><input id="resolution" type="number" min="20" max="300" step="10" value="150"></div>
+          <div><label for="frame">边框宽度 (mm)</label><input id="frame" type="number" min="0" step="0.5" value="3"></div>
+        </div>
+        <p class="hint">分辨率越高，细节和 STL 文件都会越大。推荐 100–200。</p>
+        <button id="download" type="submit" disabled>生成并下载 STL</button>
+        <p class="privacy">图片仅在本机浏览器中处理，不会上传。</p>
+      </form>
+      <section class="panel preview">
+        <canvas id="canvas"></canvas>
+        <div id="placeholder">选择一张图片后，会在这里显示灰度预览。</div>
+        <p id="stats"></p>
+      </section>
+    </section>
+  </main>
+  <script>
+    const $ = id => document.getElementById(id);
+    const fileInput = $("file"), canvas = $("canvas"), context = canvas.getContext("2d", { willReadFrequently: true });
+    let sourceImage = null, grayscale = null, imageName = "lithophane";
+
+    function gaussianBlur(values, width, height, sigma) {
+      const radius = Math.max(1, Math.ceil(sigma * 3)), kernel = [];
+      let total = 0;
+      for (let n = -radius; n <= radius; n++) { const v = Math.exp(-(n * n) / (2 * sigma * sigma)); kernel.push(v); total += v; }
+      for (let n = 0; n < kernel.length; n++) kernel[n] /= total;
+      const horizontal = new Float32Array(values.length), output = new Float32Array(values.length);
+      const reflect = (i, limit) => i < 0 ? -i : i >= limit ? 2 * limit - i - 2 : i;
+      for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+        let sum = 0; for (let k = -radius; k <= radius; k++) sum += values[y * width + reflect(x + k, width)] * kernel[k + radius];
+        horizontal[y * width + x] = sum;
+      }
+      for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+        let sum = 0; for (let k = -radius; k <= radius; k++) sum += horizontal[reflect(y + k, height) * width + x] * kernel[k + radius];
+        output[y * width + x] = sum;
+      }
+      return output;
+    }
+
+    function refreshPreview() {
+      if (!sourceImage) return;
+      const maxSize = Number($("resolution").value) || 150;
+      const scale = Math.min(1, maxSize / Math.max(sourceImage.naturalWidth, sourceImage.naturalHeight));
+      canvas.width = Math.max(2, Math.round(sourceImage.naturalWidth * scale));
+      canvas.height = Math.max(2, Math.round(sourceImage.naturalHeight * scale));
+      context.drawImage(sourceImage, 0, 0, canvas.width, canvas.height);
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height), values = new Float32Array(canvas.width * canvas.height);
+      for (let i = 0; i < values.length; i++) {
+        const p = i * 4; values[i] = .299 * pixels.data[p] + .587 * pixels.data[p + 1] + .114 * pixels.data[p + 2];
+        pixels.data[p] = pixels.data[p + 1] = pixels.data[p + 2] = values[i];
+      }
+      grayscale = gaussianBlur(values, canvas.width, canvas.height, 1.0);
+      for (let i = 0; i < grayscale.length; i++) { const g = grayscale[i]; pixels.data[i * 4] = pixels.data[i * 4 + 1] = pixels.data[i * 4 + 2] = g; }
+      context.putImageData(pixels, 0, 0); canvas.style.display = "block"; $("placeholder").style.display = "none";
+      $("download").disabled = false; $("stats").textContent = `正在使用 ${canvas.width} × ${canvas.height} 个图像采样点`;
+    }
+
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files[0]; if (!file) return;
+      imageName = file.name.replace(/\.[^.]+$/, "") || "lithophane";
+      sourceImage = new Image(); sourceImage.onload = refreshPreview; sourceImage.src = URL.createObjectURL(file);
+    });
+    $("resolution").addEventListener("change", refreshPreview);
+
+    function addTriangle(buffer, a, b, c) {
+      const normalX = (b[1]-a[1])*(c[2]-a[2])-(b[2]-a[2])*(c[1]-a[1]);
+      const normalY = (b[2]-a[2])*(c[0]-a[0])-(b[0]-a[0])*(c[2]-a[2]);
+      const normalZ = (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]);
+      const length = Math.hypot(normalX, normalY, normalZ) || 1, values = [normalX/length,normalY/length,normalZ/length,...a,...b,...c];
+      for (const value of values) { buffer.setFloat32(buffer.offset, value, true); buffer.offset += 4; }
+      buffer.setUint16(buffer.offset, 0, true); buffer.offset += 2;
+    }
+
+    $("settings").addEventListener("submit", event => {
+      event.preventDefault(); if (!grayscale) return;
+      const width = Number($("width").value), min = Number($("min").value), max = Number($("max").value), frame = Number($("frame").value);
+      const requestedHeight = $("height").value, height = requestedHeight ? Number(requestedHeight) : width * (canvas.height - 1) / (canvas.width - 1);
+      if (!(width > 0 && height > 0 && min > 0 && max >= min && frame >= 0)) return alert("请检查尺寸和厚度设置。");
+      const pixelMm = Math.min(width/(canvas.width-1), height/(canvas.height-1)), border = Math.round(frame/pixelMm);
+      const rows = canvas.height + border * 2, cols = canvas.width + border * 2, heights = new Float32Array(rows * cols).fill(min);
+      const smooth = gaussianBlur(grayscale, canvas.width, canvas.height, .65);
+      for (let y=0; y<canvas.height; y++) for (let x=0; x<canvas.width; x++) heights[(y+border)*cols+x+border] = min + (255-smooth[y*canvas.width+x])/255*(max-min);
+      const cells = (rows-1)*(cols-1), triangles = cells*4 + 4*((rows-1)+(cols-1));
+      const data = new DataView(new ArrayBuffer(84 + triangles * 50)); data.setUint32(80, triangles, true); data.offset = 84;
+      const finalWidth = width + border*2*pixelMm, finalHeight = height + border*2*pixelMm;
+      const top = (r,c) => [c*finalWidth/(cols-1),r*finalHeight/(rows-1),heights[r*cols+c]], bottom = (r,c) => [c*finalWidth/(cols-1),r*finalHeight/(rows-1),0];
+      for (let r=0;r<rows-1;r++) for (let c=0;c<cols-1;c++) {
+        const tl=top(r,c),tr=top(r,c+1),bl=top(r+1,c),br=top(r+1,c+1); addTriangle(data,tl,tr,br); addTriangle(data,tl,br,bl);
+        const btl=bottom(r,c),btr=bottom(r,c+1),bbl=bottom(r+1,c),bbr=bottom(r+1,c+1); addTriangle(data,btl,bbr,btr); addTriangle(data,btl,bbl,bbr);
+      }
+      const edges = [[...Array(cols).keys()].map(c=>[0,c]), [...Array(rows).keys()].map(r=>[r,cols-1]), [...Array(cols).keys()].reverse().map(c=>[rows-1,c]), [...Array(rows).keys()].reverse().map(r=>[r,0])];
+      for (const edge of edges) for (let i=0;i<edge.length-1;i++) { const [r1,c1]=edge[i],[r2,c2]=edge[i+1]; addTriangle(data,bottom(r1,c1),top(r2,c2),top(r1,c1)); addTriangle(data,bottom(r1,c1),bottom(r2,c2),top(r2,c2)); }
+      const link=document.createElement("a"); link.href=URL.createObjectURL(new Blob([data.buffer],{type:"model/stl"})); link.download=`${imageName}-lithophane.stl`; link.click(); URL.revokeObjectURL(link.href);
+      $("stats").textContent = `已生成 ${triangles.toLocaleString()} 个三角面，可导入切片软件打印。`;
+    });
+  </script>
+</body>
+</html>
